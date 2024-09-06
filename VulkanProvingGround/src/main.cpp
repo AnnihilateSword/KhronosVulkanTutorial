@@ -16,6 +16,9 @@
 const uint32_t WIDTH = 800;
 const uint32_t HEIGHT = 600;
 
+// 同时处理多少帧
+const int MAX_FRAMES_IN_FLIGHT = 2;
+
 /** 验证层 */
 const std::vector<const char*> validationLayers = {
 	"VK_LAYER_KHRONOS_validation"
@@ -120,16 +123,17 @@ private:
 	// command pool
 	VkCommandPool commandPool;
 	// 当命令池被销毁时，命令缓冲区将自动释放
-	VkCommandBuffer commandBuffer;
+	std::vector<VkCommandBuffer> commandBuffers;
 
 	// 同步对象
 	/**
 	 * 我们需要一个信号量来表示已从交换链获取图像并准备好渲染，
 	 * 另一个信号量来表示渲染已完成并且可以进行呈现，以及一个栅栏来确保一次仅渲染一帧。
 	 */
-	VkSemaphore imageAvailableSemaphore;
-	VkSemaphore renderFinishedSemaphore;
-	VkFence inFlightFence;
+	std::vector<VkSemaphore> imageAvailableSemaphores;
+	std::vector<VkSemaphore> renderFinishedSemaphores;
+	std::vector<VkFence> inFlightFences;
+	uint32_t currentFrame = 0;
 
 private:
 	void InitWindow()
@@ -156,7 +160,7 @@ private:
 		CreateGraphicsPipeline();
 		CreateFramebuffers();
 		CreateCommandPool();
-		CreateCommandBuffer();
+		CreateCommandBuffers();
 		CreateSyncObjects();
 	}
 
@@ -168,14 +172,20 @@ private:
 			DrawFrame();
 		}
 
+		// drawFrame中的所有操作都是异步的。
+		// 这意味着当我们退出mainLoop中的循环时，绘图和演示操作可能仍在继续。在这种情况发生时清理资源是一个坏主意
+		// 为了解决这个问题，我们应该等待逻辑设备完成操作，然后再退出mainLoop并销毁窗口
 		vkDeviceWaitIdle(device);
 	}
 
 	void Cleanup()
 	{
-		vkDestroySemaphore(device, imageAvailableSemaphore, nullptr);
-		vkDestroySemaphore(device, renderFinishedSemaphore, nullptr);
-		vkDestroyFence(device, inFlightFence, nullptr);
+		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+		{
+			vkDestroySemaphore(device, imageAvailableSemaphores[i], nullptr);
+			vkDestroySemaphore(device, renderFinishedSemaphores[i], nullptr);
+			vkDestroyFence(device, inFlightFences[i], nullptr);
+		}
 
 		vkDestroyCommandPool(device, commandPool, nullptr);
 
@@ -759,22 +769,23 @@ private:
 		}
 	}
 
-	void CreateCommandBuffer()
+	void CreateCommandBuffers()
 	{
 		/**
 		 * 命令缓冲区通过将它们提交到其中一个设备队列(如我们检索的图形和表示队列)来执行。
 		 * 每个命令池只能分配在单一类型队列上提交的命令缓冲区。我们将记录用于绘图的命令，这就是我们选择图形队列家族的原因。
 		 */
 
+		commandBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+
 		VkCommandBufferAllocateInfo allocInfo{};
 		allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
 		allocInfo.commandPool = commandPool;
 		// VK_COMMAND_BUFFER_LEVEL_PRIMARY：可以提交到队列执行，但不能从其他命令缓冲区调用
 		allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-		// 由于我们只分配一个命令缓冲区，因此commandBufferCount参数仅为 1
-		allocInfo.commandBufferCount = 1;
+		allocInfo.commandBufferCount = (uint32_t)commandBuffers.size();
 
-		if (vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer) != VK_SUCCESS)
+		if (vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data()) != VK_SUCCESS)
 		{
 			throw std::runtime_error("failed to allocate command buffers!");
 		}
@@ -782,6 +793,10 @@ private:
 
 	void CreateSyncObjects()
 	{
+		imageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+		renderFinishedSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+		inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
+
 		VkSemaphoreCreateInfo semaphoreInfo{};
 		semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
@@ -795,11 +810,14 @@ private:
 		// 在有信号状态下创建栅栏，这样对 vkWaitForFences() 的第一次调用就会立即返回，因为栅栏已经有信号了。
 		fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-		if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &imageAvailableSemaphore) != VK_SUCCESS ||
-			vkCreateSemaphore(device, &semaphoreInfo, nullptr, &renderFinishedSemaphore) != VK_SUCCESS ||
-			vkCreateFence(device, &fenceInfo, nullptr, &inFlightFence) != VK_SUCCESS)
+		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
 		{
-			throw std::runtime_error("failed to create semaphores!");
+			if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &imageAvailableSemaphores[i]) != VK_SUCCESS ||
+				vkCreateSemaphore(device, &semaphoreInfo, nullptr, &renderFinishedSemaphores[i]) != VK_SUCCESS ||
+				vkCreateFence(device, &fenceInfo, nullptr, &inFlightFences[i]) != VK_SUCCESS)
+			{
+				throw std::runtime_error("failed to create semaphores!");
+			}
 		}
 	}
 
@@ -922,33 +940,33 @@ private:
 		 */
 
 		 // 看 Fences 的创建，解决第一帧等待时无限堵塞问题
-		vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
+		vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
 		// 等待后，我们需要使用vkResetFences调用手动将栅栏重置为无信号状态：
-		vkResetFences(device, 1, &inFlightFence);
+		vkResetFences(device, 1, &inFlightFences[currentFrame]);
 
 		// 从交换链获取图像，这里设置了参数，当获取图像完成时发出信号量 imageAvailableSemaphore
 		uint32_t imageIndex;
-		vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+		vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
 
 		// 记录命令缓冲区
-		vkResetCommandBuffer(commandBuffer, 0);
-		RecordCommandBuffer(commandBuffer, imageIndex);
+		vkResetCommandBuffer(commandBuffers[currentFrame], 0);
+		RecordCommandBuffer(commandBuffers[currentFrame], imageIndex);
 
 		// 提交命令缓冲区
 		VkSubmitInfo submitInfo{};
 		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 
 		// 指定在执行开始之前要等待哪些信号量 以及 要在管道的哪个阶段等待
-		VkSemaphore waitSemaphores[] = { imageAvailableSemaphore };
+		VkSemaphore waitSemaphores[] = { imageAvailableSemaphores[currentFrame] };
 		// 我们希望等待将颜色写入图像，直到它可用为止，因此我们指定写入颜色附件的图形管道的阶段。
 		VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
 		submitInfo.waitSemaphoreCount = 1;
 		submitInfo.pWaitSemaphores = waitSemaphores;
 		submitInfo.pWaitDstStageMask = waitStages;
 		submitInfo.commandBufferCount = 1;
-		submitInfo.pCommandBuffers = &commandBuffer;
+		submitInfo.pCommandBuffers = &commandBuffers[currentFrame];
 
-		VkSemaphore signalSemaphores[] = { renderFinishedSemaphore };
+		VkSemaphore signalSemaphores[] = { renderFinishedSemaphores[currentFrame] };
 		// signalSemaphoreCount 和 pSignalSemaphores 参数指定命令缓冲区完成执行后要发出信号的信号量
 		submitInfo.signalSemaphoreCount = 1;
 		submitInfo.pSignalSemaphores = signalSemaphores;
@@ -956,7 +974,7 @@ private:
 		// 最后一个参数引用一个可选的栅栏，当命令缓冲区完成执行时将发出信号。
 		// 这使我们能够知道何时可以安全地重用命令缓冲区，因此我们希望将其赋予inFlightFence 。
 		// 现在，在下一帧，CPU 将等待该命令缓冲区完成执行，然后再将新命令记录到其中。
-		if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFence) != VK_SUCCESS)
+		if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFences[currentFrame]) != VK_SUCCESS)
 		{
 			throw std::runtime_error("failed to submit draw command buffer!");
 		}
@@ -976,6 +994,9 @@ private:
 
 		// 向交换链提交呈现图像的请求
 		vkQueuePresentKHR(presentQueue, &presentInfo);
+
+		// 每次都前进到下一帧，并确保帧索引在每个 MAX_FRAMES_IN_FLIGHT 排队帧之后循环
+		currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
 	}
 
 	VkShaderModule CreateShaderModule(const std::vector<char>& code)
