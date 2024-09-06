@@ -119,9 +119,15 @@ struct Vertex
 
 // vertex data
 const std::vector<Vertex> vertices = {
-	{{0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+	{{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+	{{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
 	{{0.5f, 0.5f}, {1.0f, 0.0f, 1.0f}},
-	{{-0.5f, 0.5f}, {0.0f, 1.0f, 1.0f}}
+	{{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}
+};
+
+// index data
+const std::vector<uint16_t> indices = {
+	0, 1, 2, 2, 3, 0
 };
 
 
@@ -170,6 +176,8 @@ private:
 
 	VkBuffer vertexBuffer;
 	VkDeviceMemory vertexBufferMemory;
+	VkBuffer indexBuffer;
+	VkDeviceMemory indexBufferMemory;
 
 	// 当命令池被销毁时，命令缓冲区将自动释放
 	std::vector<VkCommandBuffer> commandBuffers;
@@ -222,6 +230,7 @@ private:
 		CreateFramebuffers();
 		CreateCommandPool();
 		CreateVertexBuffer();
+		CreateIndexBuffer();
 		CreateCommandBuffers();
 		CreateSyncObjects();
 	}
@@ -258,6 +267,9 @@ private:
 	void Cleanup()
 	{
 		CleanupSwapChain();
+
+		vkDestroyBuffer(device, indexBuffer, nullptr);
+		vkFreeMemory(device, indexBufferMemory, nullptr);
 
 		vkDestroyBuffer(device, vertexBuffer, nullptr);
 		vkFreeMemory(device, vertexBufferMemory, nullptr);
@@ -917,8 +929,43 @@ private:
 		vkFreeMemory(device, stagingBufferMemory, nullptr);
 	}
 
+	void CreateIndexBuffer()
+	{
+		/**
+		 * 我们创建一个临时缓冲区来将indices的内容复制到其中，然后将其复制到最终的设备本地索引缓冲区（跟创建顶点缓冲区一样）
+		 */
+
+		VkDeviceSize bufferSize = sizeof(indices[0]) * indices.size();
+
+		VkBuffer stagingBuffer;
+		VkDeviceMemory stagingBufferMemory;
+		CreateBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+		void* data;
+		vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+		memcpy(data, indices.data(), (size_t)bufferSize);
+		vkUnmapMemory(device, stagingBufferMemory);
+
+		CreateBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, indexBuffer, indexBufferMemory);
+
+		CopyBuffer(stagingBuffer, indexBuffer, bufferSize);
+
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+		vkFreeMemory(device, stagingBufferMemory, nullptr);
+	}
+
 	void CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& buffferMemory)
 	{
+		/**
+		 * 您应该从单个内存分配中分配多个资源，例如缓冲区，但实际上您应该更进一步。
+		 * https://developer.nvidia.com/vulkan-memory-management
+		 * 驱动程序开发人员建议您还将多个缓冲区（例如顶点和索引缓冲区）存储到单个VkBuffer中，
+		 * 并在vkCmdBindVertexBuffers等命令中使用偏移量。优点是在这种情况下您的数据对缓存更加友好，
+		 * 因为它们更接近。如果在相同的渲染操作期间不使用多个资源，甚至可以将相同的内存块重用于多个资源，
+		 * 当然前提是它们的数据被刷新。
+		 * 这称为别名，一些 Vulkan 函数具有显式标志来指定您要执行此操作。
+		 */
+
 		VkBufferCreateInfo bufferInfo{};
 		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
 		bufferInfo.size = size;
@@ -1113,11 +1160,6 @@ private:
 		// 第二个参数指定管道对象是图形管道还是计算管道
 		vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
 
-		// 绑定顶点缓冲区
-		VkBuffer vertexBuffers[] = { vertexBuffer };
-		VkDeviceSize offsets[] = { 0 };
-		vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
-
 		// 我们指定了视口和剪刀状态以使该管道是动态的。因此，我们需要在发出绘制命令之前将它们设置在命令缓冲区中：
 		VkViewport viewport{};
 		viewport.x = 0.0f;
@@ -1133,9 +1175,16 @@ private:
 		scissor.extent = swapChainExtent;
 		vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
+		// 绑定顶点缓冲区
+		VkBuffer vertexBuffers[] = { vertexBuffer };
+		VkDeviceSize offsets[] = { 0 };
+		vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+		// 绑定索引缓冲区
+		vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+
 		// 绘制
 		// ----
-		vkCmdDraw(commandBuffer, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+		vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
 
 		// 结束渲染通道
 		// -----------
