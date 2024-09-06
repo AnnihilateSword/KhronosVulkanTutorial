@@ -1,12 +1,15 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+//#define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 #include <iostream>
 #include <fstream>
 #include <stdexcept>
 #include <algorithm>
+#include <chrono>
 #include <vector>
 #include <cstring>
 #include <cstdlib>
@@ -117,6 +120,16 @@ struct Vertex
 	}
 };
 
+// UBO
+struct UniformBufferObject
+{
+	//glm::vec2 foo;
+	//alignas(16) glm::mat4 model;
+	glm::mat4 model;
+	glm::mat4 view;
+	glm::mat4 proj;
+};
+
 // vertex data
 const std::vector<Vertex> vertices = {
 	{{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
@@ -168,16 +181,28 @@ private:
 
 	// RenderPass
 	VkRenderPass renderPass;
+	// 描述符布局
+	VkDescriptorSetLayout descriptorSetLayout;
 	VkPipelineLayout pipelineLayout;
 	VkPipeline graphicsPipeline;
 
 	// command pool
 	VkCommandPool commandPool;
 
+	// buffers
 	VkBuffer vertexBuffer;
 	VkDeviceMemory vertexBufferMemory;
 	VkBuffer indexBuffer;
 	VkDeviceMemory indexBufferMemory;
+
+	// uniform buffers
+	std::vector<VkBuffer> uniformBuffers;
+	std::vector<VkDeviceMemory> uniformBuffersMemory;
+	std::vector<void*> uniformBuffersMapped;
+
+	VkDescriptorPool descriptorPool;
+	// 不需要显式清理描述符集，因为它们会在描述符池被销毁时自动释放
+	std::vector<VkDescriptorSet> descriptorSets;
 
 	// 当命令池被销毁时，命令缓冲区将自动释放
 	std::vector<VkCommandBuffer> commandBuffers;
@@ -226,11 +251,15 @@ private:
 		CreateSwapChain();
 		CreateImageViews();
 		CreateRenderPass();
+		CreateDescriptorSetLayout();
 		CreateGraphicsPipeline();
 		CreateFramebuffers();
 		CreateCommandPool();
 		CreateVertexBuffer();
 		CreateIndexBuffer();
+		CreateUniformBuffers();
+		CreateDescriptorPool();
+		CreateDescriptorSets();
 		CreateCommandBuffers();
 		CreateSyncObjects();
 	}
@@ -267,6 +296,16 @@ private:
 	void Cleanup()
 	{
 		CleanupSwapChain();
+
+		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+		{
+			vkDestroyBuffer(device, uniformBuffers[i], nullptr);
+			vkFreeMemory(device, uniformBuffersMemory[i], nullptr);
+		}
+
+		vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+
+		vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 
 		vkDestroyBuffer(device, indexBuffer, nullptr);
 		vkFreeMemory(device, indexBufferMemory, nullptr);
@@ -673,6 +712,34 @@ private:
 		}
 	}
 
+	void CreateDescriptorSetLayout()
+	{
+		/** 描述符集布局描述了可以绑定的描述符的类型 */
+
+		VkDescriptorSetLayoutBinding uboLayoutBinding{};
+		// 前两个字段指定着色器中使用的 binding 和描述符的类型
+		uboLayoutBinding.binding = 0;
+		uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+		// descriptorCount 指定数组中值的数量。例如，这可用于为骨骼动画的骨骼中的每个骨骼指定变换
+		// 我们的 MVP 转换位于单个统一缓冲区对象中，因此我们使用的descriptorCount为 1
+		uboLayoutBinding.descriptorCount = 1;
+		// 我们还需要指定描述符将在哪个着色器阶段被引用。
+		// stageFlags 字段可以是 VkShaderStageFlagBits 值或值 VK_SHADER_STAGE_ALL_GRAPHICS 的组合。
+		uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+		// 采样相关暂时不涉及
+		uboLayoutBinding.pImmutableSamplers = nullptr;
+
+		VkDescriptorSetLayoutCreateInfo layoutInfo{};
+		layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+		layoutInfo.bindingCount = 1;
+		layoutInfo.pBindings = &uboLayoutBinding;
+
+		if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS)
+		{
+			throw std::runtime_error("failed to create descriptor set layout!");
+		}
+	}
+
 	void CreateGraphicsPipeline()
 	{
 		// shaders
@@ -731,7 +798,9 @@ private:
 		rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
 		rasterizer.lineWidth = 1.0f;
 		rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
-		rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+		// 由于我们在投影矩阵中进行了 Y 翻转，顶点现在以逆时针顺序而不是顺时针顺序绘制。
+		//rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+		rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 		// 使用此功能需要启用 GPU 功能，暂时先不用
 		rasterizer.depthBiasEnable = VK_FALSE;
 		rasterizer.depthBiasConstantFactor = 0.0f;
@@ -797,8 +866,9 @@ private:
 		// 该结构还指定了推送常量，这是将动态值传递给着色器的另一种方式
 		VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
 		pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-		pipelineLayoutInfo.setLayoutCount = 0;				// Optional
-		pipelineLayoutInfo.pSetLayouts = nullptr;			// Optional
+		// 我们需要在管道创建期间指定描述符集布局，以告诉 Vulkan 着色器将使用哪些描述符。
+		pipelineLayoutInfo.setLayoutCount = 1;
+		pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
 		pipelineLayoutInfo.pushConstantRangeCount = 0;		// Optional
 		pipelineLayoutInfo.pPushConstantRanges = nullptr;	// Optional
 
@@ -952,6 +1022,100 @@ private:
 
 		vkDestroyBuffer(device, stagingBuffer, nullptr);
 		vkFreeMemory(device, stagingBufferMemory, nullptr);
+	}
+
+	void CreateUniformBuffers()
+	{
+		VkDeviceSize bufferSize = sizeof(UniformBufferObject);
+
+		// 我们将每帧将新数据复制到统一缓冲区，因此拥有暂存缓冲区实际上没有任何意义。
+		// 在这种情况下，它只会增加额外的开销，并且可能会降低性能而不是提高性能。
+
+		// 我们应该有多个缓冲区，因为多个帧可能同时在飞行，我们不想在前一帧仍在读取时更新缓冲区以准备下一帧！
+		// 因此，我们需要拥有与飞行中的帧一样多的统一缓冲区，并写入当前未由 GPU 读取的统一缓冲区。
+		uniformBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+		uniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT);
+		uniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT);
+
+		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+		{
+			CreateBuffer(bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, uniformBuffers[i], uniformBuffersMemory[i]);
+
+			// 这里没有用 vkUnmapMemory 了
+			// 在应用程序的整个生命周期中，缓冲区始终映射到该指针。该技术称为“持久映射” ，适用于所有 Vulkan 实现。
+			// 不必每次需要更新缓冲区时都映射缓冲区，从而提高性能，因为映射不是免费的。
+			// 统一数据将用于所有绘制调用，因此仅当我们停止渲染时才应销毁包含它的缓冲区。
+			vkMapMemory(device, uniformBuffersMemory[i], 0, bufferSize, 0, &uniformBuffersMapped[i]);
+		}
+	}
+
+	void CreateDescriptorPool()
+	{
+		// 描述符集不能直接创建，它们必须像命令缓冲区一样从池中分配
+
+		VkDescriptorPoolSize poolSize{};
+		// 指定包含的描述符类型
+		poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+		// 我们将为每一帧分配一个描述符
+		poolSize.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+
+		VkDescriptorPoolCreateInfo poolInfo{};
+		poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+		poolInfo.poolSizeCount = 1;
+		poolInfo.pPoolSizes = &poolSize;
+		poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+
+		if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS)
+		{
+			throw std::runtime_error("failed to create descriptor pool!");
+		}
+	}
+
+	void CreateDescriptorSets()
+	{
+		/**
+		 * 为每个 VkBuffer 资源创建一个描述符集，以将其绑定到统一缓冲区描述符
+		 */
+
+		std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, descriptorSetLayout);
+		VkDescriptorSetAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		// 指定要分配的描述符池，要分配的描述集数量
+		allocInfo.descriptorPool = descriptorPool;
+		allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+		// 指定所基于的描述符布局
+		allocInfo.pSetLayouts = layouts.data();
+
+		descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
+		if (vkAllocateDescriptorSets(device, &allocInfo, descriptorSets.data()) != VK_SUCCESS)
+		{
+			throw std::runtime_error("failed to allocate descriptor sets!");
+		}
+
+		// 现在描述符集已分配完毕，这里填充每个描述符
+		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+		{
+			VkDescriptorBufferInfo bufferInfo{};
+			// uniform buffer
+			bufferInfo.buffer = uniformBuffers[i];
+			bufferInfo.offset = 0;
+			bufferInfo.range = sizeof(UniformBufferObject);
+
+			VkWriteDescriptorSet descriptorWrite{};
+			descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			descriptorWrite.dstSet = descriptorSets[i];
+			descriptorWrite.dstBinding = 0;
+			// 描述符可以是数组，因此我们还需要指定要更新的数组中的第一个索引
+			descriptorWrite.dstArrayElement = 0;
+			descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+			descriptorWrite.descriptorCount = 1;
+			descriptorWrite.pBufferInfo = &bufferInfo;
+			descriptorWrite.pImageInfo = nullptr;		// Optional
+			descriptorWrite.pTexelBufferView = nullptr; // Optional
+
+			// 更新描述符
+			vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+		}
 	}
 
 	void CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& buffferMemory)
@@ -1182,6 +1346,10 @@ private:
 		// 绑定索引缓冲区
 		vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
 
+		// 绑定描述符集
+		// 描述符集并不是图形管道所独有的。因此，我们需要指定是否要将描述符集绑定到图形或计算管道
+		vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSets[currentFrame], 0, nullptr);
+
 		// 绘制
 		// ----
 		vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
@@ -1194,6 +1362,28 @@ private:
 		{
 			throw std::runtime_error("failed to record command buffer!");
 		}
+	}
+
+	void UpdateUniformBuffer(uint32_t currentImage)
+	{
+		// 以这种方式使用 UBO 并不是将频繁更改的值传递给着色器的最有效方法。
+		// 将小缓冲区数据传递给着色器的更有效方法是推送常量。
+
+		static auto startTime = std::chrono::high_resolution_clock::now();
+
+		auto currentTime = std::chrono::high_resolution_clock::now();
+		float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+
+		UniformBufferObject ubo{};
+		ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+		ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+		ubo.proj = glm::perspective(glm::radians(45.0f), swapChainExtent.width / (float)swapChainExtent.height, 0.1f, 10.0f);
+
+		// GLM 最初是为 OpenGL 设计的，其中剪辑坐标的Y坐标是倒置的。
+		// 补偿这一问题的最简单方法是翻转投影矩阵中 Y 轴缩放因子的符号。如果不这样做，图像将呈现颠倒状态。
+		ubo.proj[1][1] *= -1;
+
+		memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
 	}
 
 	void DrawFrame()
@@ -1248,7 +1438,7 @@ private:
 		 *
 		 */
 
-		 // 看 Fences 的创建，解决第一帧等待时无限堵塞问题
+		// 看 Fences 的创建，解决第一帧等待时无限堵塞问题
 		vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
 
 		// 从交换链获取图像，这里设置了参数，当获取图像完成时发出信号量 imageAvailableSemaphore
@@ -1263,6 +1453,9 @@ private:
 		{
 			throw std::runtime_error("failed to acquire swap chain image!");
 		}
+
+		// Update UBO
+		UpdateUniformBuffer(currentFrame);
 
 		// 延迟重置栅栏，直到我们确定我们将使用它提交工作之后，在重置交换链之后，防 vkWaitForFences 死锁
 		// 等待后，我们需要使用 vkResetFences 调用手动将栅栏重置为无信号状态
