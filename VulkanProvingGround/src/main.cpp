@@ -879,21 +879,61 @@ private:
 
 	void CreateVertexBuffer()
 	{
+		VkDeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
+
+		VkBuffer stagingBuffer;
+		VkDeviceMemory stagingBufferMemory;
+		// VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT bit 指定可以使用vkMapMemory映射以此类型分配的内存以供主机访问。
+		// VK_MEMORY_PROPERTY_HOST_COHERENT_BIT bit 指定主机缓存管理命令
+		//		vkFlushMappedMemoryRanges 和 vkInvalidateMappedMemoryRanges 不需要分别刷新主机对设备的写入或使设备写入对主机可见。
+		CreateBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+		/** 将顶点数据复制到缓冲区 */
+		void* data;
+
+		// 倒数第二个参数可用于指定标志，但当前 API 中尚无可用的标志。它必须设置为值0
+		vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+		memcpy(data, vertices.data(), (size_t)bufferSize);
+		vkUnmapMemory(device, stagingBufferMemory);
+
+		/**
+		 * 现在拥有的顶点缓冲区可以正常工作，但是允许我们从 CPU 访问它的内存类型可能不是显卡本身读取的最佳内存类型
+		 * 现在更改 CreateVertexBuffer 以仅使用主机可见缓冲区作为临时缓冲区，并使用设备本地缓冲区作为实际的顶点缓冲区。
+		 * VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT 是最佳性能标志，通常不能被专用显卡上的 CPU 访问
+		 * （vertexBuffer 现在是从设备本地的内存类型分配的，这通常意味着我们无法使用vkMapMemory）
+		 * VK_BUFFER_USAGE_TRANSFER_SRC_BIT ：缓冲区可用作内存传输操作的源。
+		 * VK_BUFFER_USAGE_TRANSFER_DST_BIT ：缓冲区可用作内存传输操作中的目标。
+		 */
+		CreateBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, vertexBuffer, vertexBufferMemory);
+
+		// Copy
+		// ------------------------------
+		// 现在顶点数据正在从高性能内存加载
+		// ------------------------------
+		CopyBuffer(stagingBuffer, vertexBuffer, bufferSize);
+
+		// 将数据从暂存缓冲区复制到设备缓冲区后，我们应该清理它
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+		vkFreeMemory(device, stagingBufferMemory, nullptr);
+	}
+
+	void CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& buffferMemory)
+	{
 		VkBufferCreateInfo bufferInfo{};
 		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-		bufferInfo.size = sizeof(vertices[0]) * vertices.size();
-		bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+		bufferInfo.size = size;
+		bufferInfo.usage = usage;
 		// 缓冲区只能从图形队列中使用，因此我们可以坚持独占访问。
 		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 		bufferInfo.flags = 0;
 
-		if (vkCreateBuffer(device, &bufferInfo, nullptr, &vertexBuffer) != VK_SUCCESS)
+		if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS)
 		{
 			throw std::runtime_error("failed to create vertex buffer!");
 		}
 
 		VkMemoryRequirements memRequirements;
-		vkGetBufferMemoryRequirements(device, vertexBuffer, &memRequirements);
+		vkGetBufferMemoryRequirements(device, buffer, &memRequirements);
 
 		VkMemoryAllocateInfo allocInfo{};
 		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -907,24 +947,64 @@ private:
 		// 
 		// 刷新内存范围或使用一致的内存堆意味着驱动程序将知道我们对缓冲区的写入，但这并不意味着它们实际上在 GPU 上可见。
 		// 将数据传输到 GPU 是一个在后台发生的操作，规范只是告诉我们，保证在下次调用vkQueueSubmit时完成。
-		allocInfo.memoryTypeIndex = FindMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+		allocInfo.memoryTypeIndex = FindMemoryType(memRequirements.memoryTypeBits, properties);
 
-		if (vkAllocateMemory(device, &allocInfo, nullptr, &vertexBufferMemory) != VK_SUCCESS)
+		if (vkAllocateMemory(device, &allocInfo, nullptr, &buffferMemory) != VK_SUCCESS)
 		{
 			throw std::runtime_error("failed to allocate vertex buffer memory!");
 		}
 
 		// 第四个参数是内存区域内的偏移量。由于该内存是专门为此顶点缓冲区分配的，因此偏移量只是 0 
 		// 如果偏移量非零，则需要能被 memRequirements.alignment 整除。
-		vkBindBufferMemory(device, vertexBuffer, vertexBufferMemory, 0);
+		vkBindBufferMemory(device, buffer, buffferMemory, 0);
+	}
 
-		/** 将顶点数据复制到缓冲区 */
-		void* data;
+	void CopyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size)
+	{
+		// （可选）
+		// 您可能希望为这些类型的短期缓冲区创建一个单独的命令池，因为该实现可能能够应用内存分配优化。
+		// 您应该使用 VK_COMMAND_POOL_CREATE_TRANSIENT_BIT 在这种情况下，在命令池生成期间标记。
 
-		// 倒数第二个参数可用于指定标志，但当前 API 中尚无可用的标志。它必须设置为值0
-		vkMapMemory(device, vertexBufferMemory, 0, bufferInfo.size, 0, &data);
-		memcpy(data, vertices.data(), (size_t)bufferInfo.size);
-		vkUnmapMemory(device, vertexBufferMemory);
+		// 内存传输操作是使用命令缓冲区执行的，就像绘图命令一样，因此我们必须首先分配一个临时命令缓冲区
+		VkCommandBufferAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		allocInfo.commandPool = commandPool;
+		allocInfo.commandBufferCount = 1;
+
+		VkCommandBuffer commandBuffer;
+		vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
+
+		VkCommandBufferBeginInfo beginInfo{};
+		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		// 我们只会使用命令缓冲区一次，并等待从函数返回，直到复制操作完成执行
+		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+		vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+		VkBufferCopy copyRegion{};
+		copyRegion.srcOffset = 0;
+		copyRegion.dstOffset = 0;
+		copyRegion.size = size;
+		vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+		vkEndCommandBuffer(commandBuffer);
+
+		VkSubmitInfo submitInfo{};
+		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		submitInfo.commandBufferCount = 1;
+		submitInfo.pCommandBuffers = &commandBuffer;
+		vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+
+		/**
+		 * 与绘制命令不同，这次我们不需要等待任何事件。我们只想立即在缓冲区上执行传输。同样有两种可能的方法来等待此传输完成。
+		 * 我们可以使用栅栏并使用 vkWaitForFences 进行等待，或者只是使用 vkQueueWaitIdle 等待传输队列变得空闲。
+		 * 栅栏允许您同时安排多个传输并等待所有传输完成，而不是一次执行一个。这可能会给驾驶员更多的优化机会。
+		 */
+		vkQueueWaitIdle(graphicsQueue);
+
+		// cleanup
+		vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
 	}
 
 	/** 找到合适的内存类型来使用 */
