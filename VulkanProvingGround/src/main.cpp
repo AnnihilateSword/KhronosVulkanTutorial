@@ -135,6 +135,8 @@ private:
 	std::vector<VkFence> inFlightFences;
 	uint32_t currentFrame = 0;
 
+	bool framebufferResized = false;
+
 private:
 	void InitWindow()
 	{
@@ -142,9 +144,19 @@ private:
 
 		// don't create an OpenGL context with a subsequent call
 		glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-		glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+		//glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
 		window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
+		glfwSetWindowUserPointer(window, this);
+		glfwSetFramebufferSizeCallback(window, FramebufferResizeCallback);
+	}
+
+	// 我们创建static函数作为回调的原因是：
+	// GLFW 不知道如何使用指向 HelloTriangleApplication 实例的正确 this 指针来正确调用成员函数。
+	static void FramebufferResizeCallback(GLFWwindow* window, int width, int height)
+	{
+		auto app = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));
+		app->framebufferResized = true;
 	}
 
 	void InitVulkan()
@@ -178,8 +190,25 @@ private:
 		vkDeviceWaitIdle(device);
 	}
 
+	void CleanupSwapChain()
+	{
+		for (auto framebuffer : swapChainFramebuffers)
+		{
+			vkDestroyFramebuffer(device, framebuffer, nullptr);
+		}
+
+		for (auto imageView : swapChainImageViews)
+		{
+			vkDestroyImageView(device, imageView, nullptr);
+		}
+		vkDestroySwapchainKHR(device, swapChain, nullptr);
+
+	}
+
 	void Cleanup()
 	{
+		CleanupSwapChain();
+
 		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
 		{
 			vkDestroySemaphore(device, imageAvailableSemaphores[i], nullptr);
@@ -189,21 +218,10 @@ private:
 
 		vkDestroyCommandPool(device, commandPool, nullptr);
 
-		for (auto framebuffer : swapChainFramebuffers)
-		{
-			vkDestroyFramebuffer(device, framebuffer, nullptr);
-		}
-
 		vkDestroyPipeline(device, graphicsPipeline, nullptr);
 		vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
 		vkDestroyRenderPass(device, renderPass, nullptr);
 
-		for (auto imageView : swapChainImageViews)
-		{
-			vkDestroyImageView(device, imageView, nullptr);
-		}
-
-		vkDestroySwapchainKHR(device, swapChain, nullptr);
 		vkDestroyDevice(device, nullptr);
 
 		if (enableValidationLayers)
@@ -213,10 +231,45 @@ private:
 
 		vkDestroySurfaceKHR(instance, surface, nullptr);
 		vkDestroyInstance(instance, nullptr);
-
 		glfwDestroyWindow(window);
 
 		glfwTerminate();
+	}
+
+	/**
+	 * 当窗口表面发生变化时，例如窗口大小，导致交换链不再与其兼容
+	 * 必须捕获这些事件并重新创建交换链
+	 */
+	void RecreateSwapChain()
+	{
+		// 处理窗口最小化的情况
+		int width = 0, height = 0;
+		glfwGetFramebufferSize(window, &width, &height);
+		while (width == 0 || height == 0)
+		{
+			glfwGetFramebufferSize(window, &width, &height);
+			glfwWaitEvents();
+		}
+
+		/**
+		 * 为了简单起见，我们不会在此处重新创建渲染通道。
+		 * 理论上，交换链图像格式有可能在应用程序的生命周期内发生变化
+		 * 例如，当将窗口从标准范围移动到高动态范围监视器时
+		 * 
+		 * 这就是重新创建交换链所需的全部！然而，这种方法的缺点是我们需要在创建新的交换链之前停止所有渲染。
+		 * 可以创建新的交换链，同时在旧交换链的图像上绘制命令仍在进行中。
+		 * 您需要将以前的交换链传递到VkSwapchainCreateInfoKHR结构中的oldSwapchain字段，并在使用完旧交换链后立即销毁它。
+		 */
+
+		// 首先调用 vkDeviceWaitIdle，我们不应该接触可能仍在使用的资源
+		vkDeviceWaitIdle(device);
+
+		// cleanup swapchain
+		CleanupSwapChain();
+
+		CreateSwapChain();
+		CreateImageViews();
+		CreateFramebuffers();
 	}
 
 	void CreateInstance()
@@ -941,12 +994,23 @@ private:
 
 		 // 看 Fences 的创建，解决第一帧等待时无限堵塞问题
 		vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
-		// 等待后，我们需要使用vkResetFences调用手动将栅栏重置为无信号状态：
-		vkResetFences(device, 1, &inFlightFences[currentFrame]);
 
 		// 从交换链获取图像，这里设置了参数，当获取图像完成时发出信号量 imageAvailableSemaphore
 		uint32_t imageIndex;
-		vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
+		VkResult result = vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
+		if (result == VK_ERROR_OUT_OF_DATE_KHR)
+		{
+			RecreateSwapChain();
+			return;
+		}
+		else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
+		{
+			throw std::runtime_error("failed to acquire swap chain image!");
+		}
+
+		// 延迟重置栅栏，直到我们确定我们将使用它提交工作之后，在重置交换链之后，防 vkWaitForFences 死锁
+		// 等待后，我们需要使用 vkResetFences 调用手动将栅栏重置为无信号状态
+		vkResetFences(device, 1, &inFlightFences[currentFrame]);
 
 		// 记录命令缓冲区
 		vkResetCommandBuffer(commandBuffers[currentFrame], 0);
@@ -993,7 +1057,18 @@ private:
 		presentInfo.pResults = nullptr;
 
 		// 向交换链提交呈现图像的请求
-		vkQueuePresentKHR(presentQueue, &presentInfo);
+		result = vkQueuePresentKHR(presentQueue, &presentInfo);
+		// 在 vkQueuePresentKHR 之后执行此操作很重要，以确保信号量处于一致状态
+		// 在这种情况下，如果交换链不是最优的，我们也会重新创建它，因为我们想要最好的结果。
+		if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || framebufferResized)
+		{
+			framebufferResized = false;
+			RecreateSwapChain();
+		}
+		else if (result != VK_SUCCESS)
+		{
+			throw std::runtime_error("failed to present swap chain image!");
+		}
 
 		// 每次都前进到下一帧，并确保帧索引在每个 MAX_FRAMES_IN_FLIGHT 排队帧之后循环
 		currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
