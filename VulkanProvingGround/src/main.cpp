@@ -1,6 +1,8 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include <glm/glm.hpp>
+
 #include <iostream>
 #include <fstream>
 #include <stdexcept>
@@ -10,6 +12,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <limits>
+#include <array>
 #include <optional>
 #include <set>
 
@@ -80,6 +83,48 @@ struct SwapChainSupportDetails
 	std::vector<VkPresentModeKHR> presentModes;
 };
 
+// Vertex
+struct Vertex
+{
+	glm::vec2 pos;
+	glm::vec3 color;
+
+	static VkVertexInputBindingDescription GetBindingDescription()
+	{
+		VkVertexInputBindingDescription bindingDescription{};
+		bindingDescription.binding = 0;
+		bindingDescription.stride = sizeof(Vertex);
+		bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+		return bindingDescription;
+	}
+
+	static std::array<VkVertexInputAttributeDescription, 2> GetAtributeDescriptions()
+	{
+		std::array<VkVertexInputAttributeDescription, 2> attributeDescriptions{};
+
+		attributeDescriptions[0].binding = 0;
+		attributeDescriptions[0].location = 0;
+		attributeDescriptions[0].format = VK_FORMAT_R32G32_SFLOAT;
+		attributeDescriptions[0].offset = offsetof(Vertex, pos);
+
+		attributeDescriptions[1].binding = 0;
+		attributeDescriptions[1].location = 1;
+		attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+		attributeDescriptions[1].offset = offsetof(Vertex, color);
+
+		return attributeDescriptions;
+	}
+};
+
+// vertex data
+const std::vector<Vertex> vertices = {
+	{{0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+	{{0.5f, 0.5f}, {1.0f, 0.0f, 1.0f}},
+	{{-0.5f, 0.5f}, {0.0f, 1.0f, 1.0f}}
+};
+
+
 class HelloTriangleApplication
 {
 public:
@@ -122,6 +167,10 @@ private:
 
 	// command pool
 	VkCommandPool commandPool;
+
+	VkBuffer vertexBuffer;
+	VkDeviceMemory vertexBufferMemory;
+
 	// 当命令池被销毁时，命令缓冲区将自动释放
 	std::vector<VkCommandBuffer> commandBuffers;
 
@@ -172,6 +221,7 @@ private:
 		CreateGraphicsPipeline();
 		CreateFramebuffers();
 		CreateCommandPool();
+		CreateVertexBuffer();
 		CreateCommandBuffers();
 		CreateSyncObjects();
 	}
@@ -208,6 +258,9 @@ private:
 	void Cleanup()
 	{
 		CleanupSwapChain();
+
+		vkDestroyBuffer(device, vertexBuffer, nullptr);
+		vkFreeMemory(device, vertexBufferMemory, nullptr);
 
 		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
 		{
@@ -634,12 +687,14 @@ private:
 		// vertex input
 		VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
 		vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-		// 因为我们直接在顶点着色器中对顶点数据进行硬编码，所以我们将填充此结构以指定目前没有要加载的顶点数据
-		// 我们将在顶点缓冲区章节中回顾它。
-		vertexInputInfo.vertexBindingDescriptionCount = 0;
-		vertexInputInfo.pVertexBindingDescriptions = nullptr;
-		vertexInputInfo.vertexAttributeDescriptionCount = 0;
-		vertexInputInfo.pVertexAttributeDescriptions = nullptr;
+
+		auto bindingDescription = Vertex::GetBindingDescription();
+		auto attributeDescriptions = Vertex::GetAtributeDescriptions();
+
+		vertexInputInfo.vertexBindingDescriptionCount = 1;
+		vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
+		vertexInputInfo.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size());
+		vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
 
 		// input assembly
 		VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
@@ -822,6 +877,73 @@ private:
 		}
 	}
 
+	void CreateVertexBuffer()
+	{
+		VkBufferCreateInfo bufferInfo{};
+		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		bufferInfo.size = sizeof(vertices[0]) * vertices.size();
+		bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+		// 缓冲区只能从图形队列中使用，因此我们可以坚持独占访问。
+		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		bufferInfo.flags = 0;
+
+		if (vkCreateBuffer(device, &bufferInfo, nullptr, &vertexBuffer) != VK_SUCCESS)
+		{
+			throw std::runtime_error("failed to create vertex buffer!");
+		}
+
+		VkMemoryRequirements memRequirements;
+		vkGetBufferMemoryRequirements(device, vertexBuffer, &memRequirements);
+
+		VkMemoryAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocInfo.allocationSize = memRequirements.size;
+
+		// 驱动程序可能不会立即将数据复制到缓冲存储器中，例如由于缓存的原因。也有可能对缓冲区的写入在映射内存中还不可见。
+		// 有两种方法可以解决这个问题：
+		// 1. 使用与主机一致的内存堆，用 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT（目前采用这种方式）
+		//			// 请记住，这可能会导致性能比显式刷新稍差
+		// 2. 写入映射内存后调用 vkFlushMappedMemoryRanges ，并调用 vkInvalidateMappedMemoryRanges 从映射内存读取之前
+		// 
+		// 刷新内存范围或使用一致的内存堆意味着驱动程序将知道我们对缓冲区的写入，但这并不意味着它们实际上在 GPU 上可见。
+		// 将数据传输到 GPU 是一个在后台发生的操作，规范只是告诉我们，保证在下次调用vkQueueSubmit时完成。
+		allocInfo.memoryTypeIndex = FindMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+		if (vkAllocateMemory(device, &allocInfo, nullptr, &vertexBufferMemory) != VK_SUCCESS)
+		{
+			throw std::runtime_error("failed to allocate vertex buffer memory!");
+		}
+
+		// 第四个参数是内存区域内的偏移量。由于该内存是专门为此顶点缓冲区分配的，因此偏移量只是 0 
+		// 如果偏移量非零，则需要能被 memRequirements.alignment 整除。
+		vkBindBufferMemory(device, vertexBuffer, vertexBufferMemory, 0);
+
+		/** 将顶点数据复制到缓冲区 */
+		void* data;
+
+		// 倒数第二个参数可用于指定标志，但当前 API 中尚无可用的标志。它必须设置为值0
+		vkMapMemory(device, vertexBufferMemory, 0, bufferInfo.size, 0, &data);
+		memcpy(data, vertices.data(), (size_t)bufferInfo.size);
+		vkUnmapMemory(device, vertexBufferMemory);
+	}
+
+	/** 找到合适的内存类型来使用 */
+	uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties)
+	{
+		VkPhysicalDeviceMemoryProperties memProperties;
+		vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+
+		for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++)
+		{
+			if (typeFilter & (1 << i) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties)
+			{
+				return i;
+			}
+		}
+
+		throw std::runtime_error("failed to find suitable memory type!");
+	}
+
 	void CreateCommandBuffers()
 	{
 		/**
@@ -911,6 +1033,11 @@ private:
 		// 第二个参数指定管道对象是图形管道还是计算管道
 		vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
 
+		// 绑定顶点缓冲区
+		VkBuffer vertexBuffers[] = { vertexBuffer };
+		VkDeviceSize offsets[] = { 0 };
+		vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+
 		// 我们指定了视口和剪刀状态以使该管道是动态的。因此，我们需要在发出绘制命令之前将它们设置在命令缓冲区中：
 		VkViewport viewport{};
 		viewport.x = 0.0f;
@@ -927,8 +1054,8 @@ private:
 		vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
 		// 绘制
-		// ---
-		vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+		// ----
+		vkCmdDraw(commandBuffer, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
 
 		// 结束渲染通道
 		// -----------
