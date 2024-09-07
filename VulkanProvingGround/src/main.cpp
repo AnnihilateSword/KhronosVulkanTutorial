@@ -235,6 +235,7 @@ private:
 	VkImageView depthImageView;
 
 	// textures
+	uint32_t mipLevels;
 	VkImage textureImage;
 	VkDeviceMemory textureImageMemory;
 	VkImageView textureImageView;
@@ -703,7 +704,7 @@ private:
 
 		for (size_t i = 0; i < swapChainImages.size(); i++)
 		{
-			swapChainImageViews[i] = CreateImageView(swapChainImages[i], swapChainImageFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+			swapChainImageViews[i] = CreateImageView(swapChainImages[i], swapChainImageFormat, VK_IMAGE_ASPECT_COLOR_BIT, 1);
 		}
 	}
 
@@ -1075,10 +1076,10 @@ private:
 
 		VkFormat depthFormat = FindDepthFormat();
 
-		CreateImage(swapChainExtent.width, swapChainExtent.height, depthFormat, VK_IMAGE_TILING_OPTIMAL, 
+		CreateImage(swapChainExtent.width, swapChainExtent.height, 1, depthFormat, VK_IMAGE_TILING_OPTIMAL, 
 			VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, depthImage, depthImageMemory);
 
-		depthImageView = CreateImageView(depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
+		depthImageView = CreateImageView(depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT, 1);
 	}
 
 	VkFormat FindDepthFormat()
@@ -1123,6 +1124,9 @@ private:
 		// 4 bytes per pixel
 		VkDeviceSize imageSize = texWidth * texHeight * 4;
 
+		// 加载纹理后，即可找到 mipLevels 的值（+1 是为了让生成的图像 level 至少为 1，0级别是原图像我们不用生成）
+		mipLevels = static_cast<uint32_t>(std::floor(std::log2(std::max(texWidth, texHeight)))) + 1;
+
 		if (!pixels)
 		{
 			throw std::runtime_error("failed to load texture image!");
@@ -1149,20 +1153,23 @@ private:
 		// 例如，图像对象允许我们使用 2D 坐标，从而使检索颜色变得更加容易和快速。
 		// 图像对象中的像素称为纹素，从此时起，我们将使用该名称。
 
-		CreateImage(texWidth, texHeight, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, 
-			VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		// Vulkan 允许我们独立转换图像的每个 mip 级别。每个 blit 一次只处理两个 mip 级别
+		CreateImage(texWidth, texHeight, mipLevels, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, 
+			VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
 
 		// 该图像是使用 VK_IMAGE_LAYOUT_UNDEFINED 布局创建的，
 		// 因此在过渡 textureImage 时应将一个图像指定为旧布局。
 		// 请记住，我们可以这样做 (VK_IMAGE_LAYOUT_UNDEFINED)，因为我们在执行复制操作之前不关心它的内容。
-		TransitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+		// 这将使纹理图像的每个级别保持 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL 。
+		// 每个级别将在 blit 命令读取完成后转换到 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL 。
+		TransitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, 
+			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipLevels);
 
 		// 将暂存区的像素数据拷贝到 Image 对象中
 		CopyBufferToImage(stagingBuffer, textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
 
-		// 为了能够从着色器中的纹理图像开始采样，我们需要最后一个过渡来为着色器访问做准备
-		TransitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		//transitioned to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL while generating mipmaps
 
 		/**
 		 * 到目前为止，提交命令的所有帮助程序函数都已设置为通过等待队列变为空闲来同步执行。
@@ -1171,12 +1178,127 @@ private:
 
 		vkDestroyBuffer(device, stagingBuffer, nullptr);
 		vkFreeMemory(device, stagingBufferMemory, nullptr);
+
+		// 纹理图像的 mipmap 现在已完全填充。
+		GenerateMipmaps(textureImage, VK_FORMAT_R8G8B8A8_SRGB, texWidth, texHeight, mipLevels);
+	}
+
+	/** 生成 Mipmap */
+	void GenerateMipmaps(VkImage image, VkFormat imageFormat, int32_t texWidth, int32_t texHeight, uint32_t mipLevels)
+	{
+		/**
+		 * 应该注意的是，在实践中，无论如何，在运行时生成 mipmap 级别并不常见
+		 * 通常，它们是预先生成的，并与基本关卡一起存储在纹理文件中，以提高加载速度
+		 */
+
+		// 使用 vkCmdBlitImage 等内置函数生成所有 mip 级别非常方便，但遗憾的是，不能保证在所有平台上都支持它。
+		// 它需要我们用来支持线性过滤的纹理图像格式，这可以通过函数 vkGetPhysicalDeviceFormatProperties 进行检查
+		// Check if image format supports linear blitting
+		VkFormatProperties formatProperties;
+		vkGetPhysicalDeviceFormatProperties(physicalDevice, imageFormat, &formatProperties);
+
+		if (!(formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))
+		{
+			throw std::runtime_error("texture image format does not support linear blitting!");
+		}
+
+		VkCommandBuffer commandBuffer = BeginSingleTimeCommands();
+
+		VkImageMemoryBarrier barrier{};
+		barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		barrier.image = image;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		barrier.subresourceRange.baseArrayLayer = 0;
+		barrier.subresourceRange.layerCount = 1;
+		barrier.subresourceRange.levelCount = 1;
+
+		int32_t mipWidth = texWidth;
+		int32_t mipHeight = texHeight;
+
+		for (uint32_t i = 1; i < mipLevels; i++)
+		{
+			// 此转换将等待级别 i - 1 被填充，无论是从上一个 blit 命令还是从 vkCmdCopyBufferToImage。
+			// 当前的 blit 命令将等待此转换。
+			// 0 是最高分辨率的图像，通常是原始的纹理大小
+			barrier.subresourceRange.baseMipLevel = i - 1;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+			vkCmdPipelineBarrier(commandBuffer,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+				0, nullptr,
+				0, nullptr,
+				1, &barrier);
+
+			VkImageBlit blit{};
+			blit.srcOffsets[0] = { 0, 0, 0 };
+			// srcOffsets[1] 和 dstOffsets[1] 的 Z 维度必须为 1，因为 2D 图像的深度为 1
+			blit.srcOffsets[1] = { mipWidth, mipHeight, 1 };
+			blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			blit.srcSubresource.mipLevel = i - 1;
+			blit.srcSubresource.baseArrayLayer = 0;
+			blit.srcSubresource.layerCount = 1;
+			blit.dstOffsets[0] = { 0, 0, 0 };
+			blit.dstOffsets[1] = { mipWidth > 1 ? mipWidth / 2 : 1, mipHeight > 1 ? mipHeight / 2 : 1, 1 };
+			blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			blit.dstSubresource.mipLevel = i;
+			blit.dstSubresource.baseArrayLayer = 0;
+			blit.dstSubresource.layerCount = 1;
+
+			// 如果您使用的是专用传输队列，请注意：vkCmdBlitImage 必须提交到具有图形功能的队列
+			// textureImage 用于 srcImage 和 dstImage 参数。这是因为我们在同一图像的不同级别之间进行块传输
+			vkCmdBlitImage(commandBuffer,
+				image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				1, &blit,
+				// 我们这里的过滤选项与制作 VkSampler 时相同
+				VK_FILTER_LINEAR);
+
+			barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+			barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+			barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+			// 此屏障将 mip 级别 i - 1 转换为 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+			// 因为已经生成了 i 级别的 mip 了，i - 1 的任务已经完成
+			// 此转换将等待当前的 blit 命令完成。所有采样操作都将等待此过渡完成。
+			vkCmdPipelineBarrier(commandBuffer,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+				0, nullptr,
+				0, nullptr,
+				1, &barrier);
+
+			// 在循环结束时，我们将当前的 mip 维度除以 2，我们在除法之前检查每个维度，以确保该维度永远不会变为 0
+			if (mipWidth > 1) mipWidth /= 2;
+			if (mipHeight > 1) mipHeight /= 2;
+		}
+
+		barrier.subresourceRange.baseMipLevel = mipLevels - 1;
+		barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+		// 在结束命令缓冲区之前，我们再插入一个管道屏障。
+		// 此屏障将最后一个 mip 级别从 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL 转换为 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+		// 循环没有处理这个问题，因为最后一个 mip 级别永远不会被 blited 出来
+		vkCmdPipelineBarrier(commandBuffer,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+			0, nullptr,
+			0, nullptr,
+			1, &barrier);
+
+		EndSingleTimeCommands(commandBuffer);
 	}
 
 	void CreateTextureImageView()
 	{
 		// 为纹理创建一个基本图像视图，以便我们稍后可以将它们用作颜色目标
-		textureImageView = CreateImageView(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT);
+		textureImageView = CreateImageView(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT, mipLevels);
 	}
 
 	void CreateTextureSampler()
@@ -1220,8 +1342,11 @@ private:
 		// 所有这些字段都适用于 mipmapping
 		samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
 		samplerInfo.mipLodBias = 0.0f;
-		samplerInfo.minLod = 0.0f;
-		samplerInfo.maxLod = 0.0f;
+		//samplerInfo.minLod = 0.0f;
+		//samplerInfo.maxLod = 0.0f;  // max 设置为 0 表示不使用 lod
+		// 这是当对象远离摄像机时使用更高 mip 级别的方式。（仅作演示）
+		samplerInfo.minLod = static_cast<float>(mipLevels / 2);
+		samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
 
 		if (vkCreateSampler(device, &samplerInfo, nullptr, &textureSampler) != VK_SUCCESS)
 		{
@@ -1230,7 +1355,7 @@ private:
 	}
 
 	/** 创建 Image View */
-	VkImageView CreateImageView(VkImage image, VkFormat format, VkImageAspectFlags aspectFlags)
+	VkImageView CreateImageView(VkImage image, VkFormat format, VkImageAspectFlags aspectFlags, uint32_t mipLevels)
 	{
 		VkImageViewCreateInfo createInfo{};
 		createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -1245,7 +1370,7 @@ private:
 		createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 		// 我们的图像将用作颜色目标，无需任何 mipmap 级别或多层
 		createInfo.subresourceRange.baseMipLevel = 0;
-		createInfo.subresourceRange.levelCount = 1;
+		createInfo.subresourceRange.levelCount = mipLevels;
 		createInfo.subresourceRange.baseArrayLayer = 0;
 		createInfo.subresourceRange.layerCount = 1;
 		createInfo.subresourceRange.aspectMask = aspectFlags;
@@ -1259,7 +1384,7 @@ private:
 		return imageView;
 	}
 
-	void CreateImage(uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, 
+	void CreateImage(uint32_t width, uint32_t height, uint32_t mipLevels, VkFormat format, VkImageTiling tiling,
 		VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory)
 	{
 		/**
@@ -1272,7 +1397,7 @@ private:
 		ImageInfo.extent.width = static_cast<uint32_t>(width);
 		ImageInfo.extent.height = static_cast<uint32_t>(height);
 		ImageInfo.extent.depth = 1;
-		ImageInfo.mipLevels = 1;
+		ImageInfo.mipLevels = mipLevels;
 		ImageInfo.arrayLayers = 1;
 		// 图形硬件可能不支持 VK_FORMAT_R8G8B8A8_SRGB 格式。
 		// 您应该有一个可接受的替代方案列表，并选择受支持的最佳替代方案。但是，对这种特定格式的支持非常广泛，因此我们将跳过此步骤
@@ -1316,7 +1441,7 @@ private:
 		vkBindImageMemory(device, image, imageMemory, 0);
 	}
 
-	void TransitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout)
+	void TransitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout, uint32_t mipLevels)
 	{
 		VkCommandBuffer commandBuffer = BeginSingleTimeCommands();
 
@@ -1338,7 +1463,7 @@ private:
 		barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 		// 我们的图像不是数组，也没有 mipmap 级别，因此只指定了一个级别和层。
 		barrier.subresourceRange.baseMipLevel = 0;
-		barrier.subresourceRange.levelCount = 1;
+		barrier.subresourceRange.levelCount = mipLevels;
 		barrier.subresourceRange.baseArrayLayer = 0;
 		barrier.subresourceRange.layerCount = 1;
 
