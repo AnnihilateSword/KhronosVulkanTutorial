@@ -3,11 +3,16 @@
 
 //#define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#define GLM_ENABLE_EXPERIMENTAL
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtx/hash.hpp>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
+
+#define TINYOBJLOADER_IMPLEMENTATION
+#include <tiny_obj_loader.h>
 
 #include <iostream>
 #include <fstream>
@@ -22,9 +27,13 @@
 #include <array>
 #include <optional>
 #include <set>
+#include <unordered_map>
 
 const uint32_t WIDTH = 800;
 const uint32_t HEIGHT = 600;
+
+const std::string MODEL_PATH = "../model/viking_room.obj";
+const std::string TEXTURE_PATH = "../model/viking_room.png";
 
 // 同时处理多少帧
 const int MAX_FRAMES_IN_FLIGHT = 2;
@@ -128,7 +137,42 @@ struct Vertex
 
 		return attributeDescriptions;
 	}
+
+	// 如果我们想要用 Vertex（用户自定义类型）作为哈希表中的键
+	// 需要我们实现两个函数：相等测试 和 哈希计算
+	bool operator==(const Vertex& other) const
+	{
+		return pos == other.pos && color == other.color && texCoord == other.texCoord;
+	}
 };
+
+namespace std
+{
+	/** 
+	 *  用户自定义类型 哈希计算
+	 *  示例：
+	 *	https://en.cppreference.com/w/cpp/utility/hash
+	 *	// Custom specialization of std::hash can be injected in namespace std.
+	 *	template<>
+	 *	struct std::hash<S>
+	 *	{
+	 *		std::size_t operator()(const S& s) const noexcept
+	 *		{
+	 *			std::size_t h1 = std::hash<std::string>{}(s.first_name);
+	 *			std::size_t h2 = std::hash<std::string>{}(s.last_name);
+	 *			return h1 ^ (h2 << 1); // or use boost::hash_combine
+	 *		}
+	 *	};
+	 */
+	template<>
+	struct hash<Vertex>
+	{
+		size_t operator()(Vertex const& vertex) const
+		{
+			return ((hash<glm::vec3>()(vertex.pos) ^ (hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^ (hash<glm::vec2>()(vertex.texCoord) << 1);
+		}
+	};
+}
 
 // UBO
 struct UniformBufferObject
@@ -139,26 +183,6 @@ struct UniformBufferObject
 	glm::mat4 view;
 	glm::mat4 proj;
 };
-
-// vertex data
-const std::vector<Vertex> vertices = {
-	{{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
-	{{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
-	{{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
-	{{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}},
-
-	{{-0.95f, -0.95f, -0.5f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
-	{{0.05f, -0.95f, -0.5f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
-	{{0.05f, 0.05f, -0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
-	{{-0.95f, 0.05f, -0.5f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}
-};
-
-// index data
-const std::vector<uint16_t> indices = {
-	0, 1, 2, 2, 3, 0,
-	4, 5, 6, 6, 7, 4
-};
-
 
 class HelloTriangleApplication
 {
@@ -216,6 +240,9 @@ private:
 	VkImageView textureImageView;
 	VkSampler textureSampler;
 
+	// vertices && index data
+	std::vector<Vertex> vertices;
+	std::vector<uint32_t> indices;
 	// buffers
 	VkBuffer vertexBuffer;
 	VkDeviceMemory vertexBufferMemory;
@@ -288,6 +315,7 @@ private:
 		CreateTextureImage();
 		CreateTextureImageView();
 		CreateTextureSampler();
+		LoadModel();
 		CreateVertexBuffer();
 		CreateIndexBuffer();
 		CreateUniformBuffers();
@@ -1091,7 +1119,7 @@ private:
 		// texChannels: actual number of channels
 		int texWidth, texHeight, texChannels;
 		// STBI_rgb_alpha 值强制图像加载 Alpha 通道，即使它没有 Alpha 通道，这对于将来与其他纹理的一致性非常有用
-		stbi_uc* pixels = stbi_load("../texture/Sasuke_1024x1024.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+		stbi_uc* pixels = stbi_load(TEXTURE_PATH.c_str(), &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
 		// 4 bytes per pixel
 		VkDeviceSize imageSize = texWidth * texHeight * 4;
 
@@ -1402,6 +1430,72 @@ private:
 		vkCmdCopyBufferToImage(commandBuffer, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
 		EndSingleTimeCommands(commandBuffer);
+	}
+
+	void LoadModel()
+	{
+		/**
+		 * OBJ 文件由位置、法线、纹理坐标和面组成。
+		 * 面由任意数量的顶点组成，其中每个顶点通过索引引用位置、法线和/或纹理坐标。这样，不仅可以重用整个顶点，还可以重用单个属性。
+		 * 
+		 * attrib 容器在其 attrib.vertices、attrib.normals 和 attrib.texcoords 矢量中包含所有位置、法线和纹理坐标
+		 * shapes 容器包含所有单独的对象及其面。每个面都由一个顶点数组组成，每个顶点都包含位置、法线和纹理坐标属性的索引
+		 * OBJ 模型还可以定义每个面的材质和纹理
+		 * err 字符串包含错误，warn 字符串包含加载文件时发生的警告，例如缺少材质定义
+		 * 
+		 * OBJ 文件中的面实际上可以包含任意数量的顶点，而我们的应用程序只能渲染三角形。
+		 * 幸运的是，LoadObj 有一个可选参数来自动对此类面进行三角剖分，该参数默认处于启用状态。
+		 */
+
+		tinyobj::attrib_t attrib;
+		std::vector<tinyobj::shape_t> shapes;
+		std::vector<tinyobj::material_t> materials;
+		std::string warn, err;
+
+		if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, MODEL_PATH.c_str()))
+		{
+			throw std::runtime_error(warn + err);
+		}
+
+		std::unordered_map<Vertex, uint32_t> uniqueVertices{};
+
+		// 迭代所有 shapes，将文件中的所有面合并到一个模型中
+		// 三角剖分功能已经确保每个面有三个顶点，因此我们现在可以直接迭代这些顶点并将它们直接转储到我们的 vertices 向量中
+		for (const auto& shape : shapes)
+		{
+			for (const auto& index : shape.mesh.indices)
+			{
+				Vertex vertex{};
+
+				vertex.pos = {
+					attrib.vertices[3 * index.vertex_index + 0],
+					attrib.vertices[3 * index.vertex_index + 1],
+					attrib.vertices[3 * index.vertex_index + 2]
+				};
+
+				vertex.texCoord = {
+					attrib.texcoords[2 * index.texcoord_index + 0],
+					// OBJ 格式采用的坐标系，其中垂直坐标 0 表示图像的底部，
+					// 需要翻转纹理坐标的垂直分量
+					1.0f - attrib.texcoords[2 * index.texcoord_index + 1]
+				};
+
+				vertex.color = { 1.0f, 1.0f, 1.0f };
+
+				// 因为许多顶点包含在多个三角形中。
+				// 我们应该只保留唯一的顶点，并使用索引缓冲区在它们出现时重用它们。
+
+				// 每次从 OBJ 文件中读取顶点时，我们都会检查之前是否已经看到过具有完全相同位置和纹理坐标的顶点。
+				// 如果没有，我们将其添加到 vertices 并将其索引存储在 uniqueVertices 容器中
+				if (uniqueVertices.count(vertex) == 0)
+				{
+					uniqueVertices[vertex] = static_cast<uint32_t>(vertices.size());
+					vertices.push_back(vertex);
+				}
+
+				indices.push_back(uniqueVertices[vertex]);
+			}
+		}
 	}
 
 	void CreateVertexBuffer()
@@ -1831,7 +1925,7 @@ private:
 		VkDeviceSize offsets[] = { 0 };
 		vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
 		// 绑定索引缓冲区
-		vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+		vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT32);
 
 		// 绑定描述符集
 		// 描述符集并不是图形管道所独有的。因此，我们需要指定是否要将描述符集绑定到图形或计算管道
@@ -1862,8 +1956,9 @@ private:
 		float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
 
 		UniformBufferObject ubo{};
-		ubo.model = glm::mat4(1.0f);
-		ubo.view = glm::lookAt(glm::vec3(0.0f, 0.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, -1.0f, 0.0f));
+		//ubo.model = glm::mat4(1.0f);
+		ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+		ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
 		ubo.proj = glm::perspective(glm::radians(45.0f), swapChainExtent.width / (float)swapChainExtent.height, 0.1f, 10.0f);
 
 		// GLM 最初是为 OpenGL 设计的，其中剪辑坐标的Y坐标是倒置的。
