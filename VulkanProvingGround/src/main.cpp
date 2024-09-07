@@ -205,6 +205,10 @@ private:
 
 	// 当 VkInstance 被销毁时，VkPhysicalDevice 将被隐式销毁
 	VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+	// 可以从与我们所选物理设备关联的 VkPhysicalDeviceProperties 中提取确切的最大样本数
+	// 我们使用的是深度缓冲区，因此我们必须考虑颜色和深度的样本计数
+	// 两者 （&） 支持的最高样本计数将是我们可以支持的最大样本数
+	VkSampleCountFlagBits msaaSamples = VK_SAMPLE_COUNT_1_BIT;
 	VkDevice device;
 	// 队列
 	VkQueue graphicsQueue;
@@ -228,6 +232,11 @@ private:
 
 	// command pool
 	VkCommandPool commandPool;
+
+	// msaa
+	VkImage colorImage;
+	VkDeviceMemory colorImageMemory;
+	VkImageView colorImageView;
 
 	// depth
 	VkImage depthImage;
@@ -310,6 +319,7 @@ private:
 		CreateDescriptorSetLayout();
 		CreateGraphicsPipeline();
 		CreateCommandPool();
+		CreateColorResources();
 		CreateDepthResources();
 		// 以确保在实际创建深度图像视图之后调用 CreateFramebuffers
 		CreateFramebuffers();
@@ -343,6 +353,10 @@ private:
 	/** 清理交换链相关资源 */
 	void CleanupSwapChain()
 	{
+		vkDestroyImageView(device, colorImageView, nullptr);
+		vkDestroyImage(device, colorImage, nullptr);
+		vkFreeMemory(device, colorImageMemory, nullptr);
+
 		vkDestroyImageView(device, depthImageView, nullptr);
 		vkDestroyImage(device, depthImage, nullptr);
 		vkFreeMemory(device, depthImageMemory, nullptr);
@@ -444,6 +458,7 @@ private:
 
 		CreateSwapChain();
 		CreateImageViews();
+		CreateColorResources();
 		CreateDepthResources();
 		CreateFramebuffers();
 	}
@@ -561,6 +576,7 @@ private:
 			if (IsDeviceSuitable(device))
 			{
 				physicalDevice = device;
+				msaaSamples = GetMaxUsableSampleCount();
 				break;
 			}
 		}
@@ -591,6 +607,8 @@ private:
 
 		VkPhysicalDeviceFeatures deviceFeatures{};
 		deviceFeatures.samplerAnisotropy = VK_TRUE;
+		// 为设备启用样本着色功能，这将进一步提高图像质量，但会额外降低性能
+		deviceFeatures.sampleRateShading = VK_TRUE;
 
 		/**
 		 * 以前的 Vulkan 实现对特定于实例和设备的验证层进行了区分，但现在情况已不再如此。
@@ -713,7 +731,8 @@ private:
 		/** 颜色附件 */
 		VkAttachmentDescription colorAttachment{};
 		colorAttachment.format = swapChainImageFormat;
-		colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+		// mass
+		colorAttachment.samples = msaaSamples;
 		colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
 		colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 		colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -721,12 +740,20 @@ private:
 		colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 		// 我们希望图像在渲染后准备好使用交换链进行呈现
 		// VK_IMAGE_LAYOUT_PRESENT_SRC_KHR：要在交换链中呈现的图像
-		colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+		//colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+		/**
+		 * 您会注意到，我们已将 finalLayout 从 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR 更改为 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL 。
+		 * 这是因为多重采样图像无法直接呈现。我们首先需要将它们解析为常规映像。
+		 * 此要求不适用于深度缓冲区，因为它不会在任何时候显示。因此，我们只需要为 color 添加一个新附件，即所谓的 resolve 附件
+		 */
+		colorAttachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
 		/** 深度附件 */
 		VkAttachmentDescription depthAttachment{};
 		depthAttachment.format = FindDepthFormat();
-		depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+		// msaa
+		depthAttachment.samples = msaaSamples;
 		depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
 		// 格式应与深度图像本身相同。这一次我们不关心存储深度数据 （storeOp），因为在绘制完成后不会使用它
 		depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -736,6 +763,17 @@ private:
 		depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 		depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
+		/** 用于多重采样的颜色附件 */
+		// 该引用将指向将用作解析目标的颜色缓冲区
+		VkAttachmentDescription colorAttachmentResolve{};
+		colorAttachmentResolve.format = swapChainImageFormat;
+		colorAttachmentResolve.samples = VK_SAMPLE_COUNT_1_BIT;
+		colorAttachmentResolve.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		colorAttachmentResolve.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		colorAttachmentResolve.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		colorAttachmentResolve.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		colorAttachmentResolve.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		colorAttachmentResolve.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
 		VkAttachmentReference colorAttachmentRef{};
 		colorAttachmentRef.attachment = 0;
@@ -745,6 +783,11 @@ private:
 		VkAttachmentReference depthAttachmentRef{};
 		depthAttachmentRef.attachment = 1;
 		depthAttachmentRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+		// 用于 msaa
+		VkAttachmentReference colorAttachmentResolveRef{};
+		colorAttachmentResolveRef.attachment = 2;
+		colorAttachmentResolveRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
 		// 一个渲染通道可以由多个子通道组成。
 		// 子通道是依赖于先前通道中framebuffer内容的后续渲染操作，例如一个接一个应用的后处理效果序列。
@@ -756,6 +799,9 @@ private:
 		subpass.pColorAttachments = &colorAttachmentRef;
 		// 与颜色附件不同，子通道只能使用单个深度 （+模板） 附件。对多个缓冲区进行深度测试实际上没有任何意义。
 		subpass.pDepthStencilAttachment = &depthAttachmentRef;
+		// 将 pResolveAttachments 子通道结构成员设置为指向新创建的附件引用。
+		// 这足以让渲染过程定义一个多重采样解析操作，该操作将允许我们将图像渲染到屏幕
+		subpass.pResolveAttachments = &colorAttachmentResolveRef;
 
 		/**
 		 * 使用深度测试需要扩展 subpass 依赖项，以确保深度图像的过渡与作为加载操作的一部分被清除之间没有冲突。
@@ -770,13 +816,13 @@ private:
 		dependency.dstSubpass = 0;
 		// 接下来的两个字段指定要等待的操作以及这些操作发生的阶段
 		dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-		dependency.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+		dependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 		// 应该等待这个的操作是在颜色附件阶段 和 片段着色器阶段
 		// 这些设置将防止过渡发生，直到它是真正必要的(和允许的):当我们想要开始写颜色。
 		dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
 		dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
-		std::array<VkAttachmentDescription, 2> attachments = { colorAttachment, depthAttachment };
+		std::array<VkAttachmentDescription, 3> attachments = { colorAttachment, depthAttachment, colorAttachmentResolve };
 		VkRenderPassCreateInfo renderPassInfo{};
 		renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
 		renderPassInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
@@ -900,15 +946,13 @@ private:
 		rasterizer.depthBiasSlopeFactor = 0.0f;
 
 		// multisample
-		// 现在暂时先禁用多重采样
 		VkPipelineMultisampleStateCreateInfo multisampling{};
 		multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
 		multisampling.sampleShadingEnable = VK_FALSE;
-		multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-		multisampling.minSampleShading = 1.0f;
-		multisampling.pSampleMask = nullptr;
-		multisampling.alphaToCoverageEnable = VK_FALSE;
-		multisampling.alphaToOneEnable = VK_FALSE;
+		multisampling.rasterizationSamples = msaaSamples;
+		// 下面两个启用会耗更多性能
+		multisampling.sampleShadingEnable = VK_TRUE;
+		multisampling.minSampleShading = 0.2f;
 
 		// depth and stencil testing
 		VkPipelineDepthStencilStateCreateInfo depthStencil{};
@@ -1022,11 +1066,12 @@ private:
 
 		for (size_t i = 0; i < swapChainImageViews.size(); i++)
 		{
-			std::array<VkImageView, 2> attachments = {
-				swapChainImageViews[i],
+			std::array<VkImageView, 3> attachments = {
+				colorImageView,
 				// 每个 Swap Chain 图像的颜色附件都不同，但所有图像都可以使用相同的深度图像
 				// 因为由于我们的信号量，只有一个 subpass 同时运行。
-				depthImageView
+				depthImageView,
+				swapChainImageViews[i]
 			};
 
 			VkFramebufferCreateInfo framebufferInfo{};
@@ -1067,6 +1112,17 @@ private:
 		}
 	}
 
+	/** 创建一个多重采样的颜色缓冲区 */
+	void CreateColorResources()
+	{
+		VkFormat colorFormat = swapChainImageFormat;
+
+		CreateImage(swapChainExtent.width, swapChainExtent.height, 1, msaaSamples, colorFormat, VK_IMAGE_TILING_OPTIMAL, 
+			VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, colorImage, colorImageMemory);
+		colorImageView = CreateImageView(colorImage, colorFormat, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+	}
+
 	void CreateDepthResources()
 	{
 		/**
@@ -1076,7 +1132,7 @@ private:
 
 		VkFormat depthFormat = FindDepthFormat();
 
-		CreateImage(swapChainExtent.width, swapChainExtent.height, 1, depthFormat, VK_IMAGE_TILING_OPTIMAL, 
+		CreateImage(swapChainExtent.width, swapChainExtent.height, 1, msaaSamples, depthFormat, VK_IMAGE_TILING_OPTIMAL,
 			VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, depthImage, depthImageMemory);
 
 		depthImageView = CreateImageView(depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT, 1);
@@ -1154,7 +1210,7 @@ private:
 		// 图像对象中的像素称为纹素，从此时起，我们将使用该名称。
 
 		// Vulkan 允许我们独立转换图像的每个 mip 级别。每个 blit 一次只处理两个 mip 级别
-		CreateImage(texWidth, texHeight, mipLevels, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, 
+		CreateImage(texWidth, texHeight, mipLevels, VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL,
 			VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
 
@@ -1295,6 +1351,23 @@ private:
 		EndSingleTimeCommands(commandBuffer);
 	}
 
+	/** 获取最大支持的样本数 */
+	VkSampleCountFlagBits GetMaxUsableSampleCount()
+	{
+		VkPhysicalDeviceProperties physicalDeviceProperties;
+		vkGetPhysicalDeviceProperties(physicalDevice, &physicalDeviceProperties);
+
+		VkSampleCountFlags counts = physicalDeviceProperties.limits.framebufferColorSampleCounts & physicalDeviceProperties.limits.framebufferDepthSampleCounts;
+		if (counts & VK_SAMPLE_COUNT_64_BIT) { return VK_SAMPLE_COUNT_64_BIT; }
+		if (counts & VK_SAMPLE_COUNT_32_BIT) { return VK_SAMPLE_COUNT_32_BIT; }
+		if (counts & VK_SAMPLE_COUNT_16_BIT) { return VK_SAMPLE_COUNT_16_BIT; }
+		if (counts & VK_SAMPLE_COUNT_8_BIT) { return VK_SAMPLE_COUNT_8_BIT; }
+		if (counts & VK_SAMPLE_COUNT_4_BIT) { return VK_SAMPLE_COUNT_4_BIT; }
+		if (counts & VK_SAMPLE_COUNT_2_BIT) { return VK_SAMPLE_COUNT_2_BIT; }
+
+		return VK_SAMPLE_COUNT_1_BIT;
+	}
+
 	void CreateTextureImageView()
 	{
 		// 为纹理创建一个基本图像视图，以便我们稍后可以将它们用作颜色目标
@@ -1342,10 +1415,10 @@ private:
 		// 所有这些字段都适用于 mipmapping
 		samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
 		samplerInfo.mipLodBias = 0.0f;
-		//samplerInfo.minLod = 0.0f;
+		samplerInfo.minLod = 0.0f;
 		//samplerInfo.maxLod = 0.0f;  // max 设置为 0 表示不使用 lod
 		// 这是当对象远离摄像机时使用更高 mip 级别的方式。（仅作演示）
-		samplerInfo.minLod = static_cast<float>(mipLevels / 2);
+		//samplerInfo.minLod = static_cast<float>(mipLevels / 2);
 		samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
 
 		if (vkCreateSampler(device, &samplerInfo, nullptr, &textureSampler) != VK_SUCCESS)
@@ -1384,7 +1457,7 @@ private:
 		return imageView;
 	}
 
-	void CreateImage(uint32_t width, uint32_t height, uint32_t mipLevels, VkFormat format, VkImageTiling tiling,
+	void CreateImage(uint32_t width, uint32_t height, uint32_t mipLevels, VkSampleCountFlagBits numSamples,VkFormat format, VkImageTiling tiling,
 		VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory)
 	{
 		/**
@@ -1417,7 +1490,7 @@ private:
 		ImageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 		// 我们还希望能够从着色器访问图像以为网格着色，因此用法应包括 VK_IMAGE_USAGE_SAMPLED_BIT
 		ImageInfo.usage = usage;
-		ImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		ImageInfo.samples = numSamples;
 		ImageInfo.flags = 0;  // Optional
 
 		if (vkCreateImage(device, &ImageInfo, nullptr, &image) != VK_SUCCESS)
